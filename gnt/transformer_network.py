@@ -2,39 +2,55 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# sin-cose embedding module
-class Embedder(nn.Module):
-    def __init__(self, **kwargs):
-        super(Embedder, self).__init__()
-        self.kwargs = kwargs
-        self.create_embedding_fn()
 
-    def create_embedding_fn(self):
-        embed_fns = []
-        d = self.kwargs["input_dims"]
-        out_dim = 0
-        if self.kwargs["include_input"]:
-            embed_fns.append(lambda x: x)
-            out_dim += d
+class RotaryPositionalEmbeddings(nn.Module):
+    """Computes rotary embeddings following the RoFormer formulation."""
 
-        max_freq = self.kwargs["max_freq_log2"]
-        N_freqs = self.kwargs["num_freqs"]
+    def __init__(self, d: int, base: int = 10000):
+        super().__init__()
+        if d % 2 != 0:
+            raise ValueError("RoPE requires an even dimension")
+        self.d = d
+        self.base = base
+        #compute [theta1....theta d/2]
+        theta = base ** (-2 * torch.arange(0, d // 2).float() / d)
+        self.register_buffer("theta", theta)
+        self.cache = {}
 
-        if self.kwargs["log_sampling"]:
-            freq_bands = 2.0 ** torch.linspace(0.0, max_freq, steps=N_freqs)
+    def _build_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        if seq_len not in self.cache:
+            positions = torch.arange(seq_len, device=device).float()
+            matrix = torch.einsum("m,d->md", positions, self.theta)
+            cos_C = torch.cos(matrix)
+            sin_C = torch.sin(matrix)
+            cos_C = torch.cat([cos_C, cos_C], dim=-1)
+            sin_C = torch.cat([sin_C, sin_C], dim=-1)
+            self.cache[seq_len] = (cos_C, sin_C)
+        cos_C, sin_C = self.cache[seq_len]
+        cos_C=cos_C.to(device=device, dtype=dtype)
+        sin_C=sin_C.to(device=device, dtype=dtype)
+        return cos_C, sin_C
+
+    def forward(self, Y: torch.Tensor, positions: torch.Tensor = None):
+        b, h, t, d = Y.shape
+        if positions is None:
+            cos_C, sin_C = self._build_cache(t, Y.device, Y.dtype)
+            cos_C = cos_C.view(1, 1, t, d)
+            sin_C = sin_C.view(1, 1, t, d)
         else:
-            freq_bands = torch.linspace(2.0**0.0, 2.0**max_freq, steps=N_freqs)
-
-        for freq in freq_bands:
-            for p_fn in self.kwargs["periodic_fns"]:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
-
-        self.embed_fns = embed_fns
-        self.out_dim = out_dim
-
-    def forward(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+            positions = positions.to(device=Y.device, dtype=Y.dtype)
+            if positions.dim() == 1:
+                positions = positions.unsqueeze(0)
+            freqs = positions[..., None] * self.theta.to(Y.device, Y.dtype)
+            cos = torch.cos(freqs)
+            sin = torch.sin(freqs)
+            cos_C = torch.cat([cos, cos], dim=-1)[:, None, :, :]
+            sin_C = torch.cat([sin, sin], dim=-1)[:, None, :, :]
+        x1 = Y[..., : d // 2]
+        x2 = Y[..., d // 2 :]
+        rotated_x1 = x1 * cos_C[..., : d // 2] - x2 * sin_C[..., : d // 2]
+        rotated_x2 = x2 * cos_C[..., d // 2 :] + x1 * sin_C[..., d // 2 :]
+        return torch.cat([rotated_x1, rotated_x2], dim=-1)
 
 
 class FeedForward(nn.Module):
@@ -49,6 +65,51 @@ class FeedForward(nn.Module):
         x = self.dp(self.activ(self.fc1(x)))
         x = self.dp(self.fc2(x))
         return x
+
+
+# TESTING FUNCTION FOR ROPE
+def test_rope_detailed():
+    d = 64
+    seq_len = 5
+    rope = RotaryPositionalEmbeddings(d)
+    
+    print("Testing RoPE implementation...")
+    
+    # basic testing
+    x = torch.randn(1, 2, seq_len, d)
+    out = rope(x)
+    print(f"✓ Input shape: {x.shape}")
+    print(f"✓ Output shape: {out.shape}")
+    
+    # sensitivity testing
+    pos1 = torch.arange(seq_len)
+    pos2 = torch.arange(seq_len).flip(0)
+    
+    out1 = rope(x, pos1)
+    out2 = rope(x, pos2)
+    
+    diff = torch.abs(out1 - out2).mean()
+    print(f"✓ Position sensitivity test - mean difference: {diff.item():.6f}")
+    
+    if diff > 1e-6:
+        print("✓ RoPE is position-sensitive (good!)")
+    else:
+        print("✗ RoPE might not be position-sensitive")
+    
+    # same position consistency testing
+    out3 = rope(x, pos1)
+    same_pos_diff = torch.abs(out1 - out3).mean()
+    print(f"✓ Same position consistency - mean difference: {same_pos_diff.item():.6f}")
+    
+    if same_pos_diff < 1e-6:
+        print("✓ Same positions produce same output (good!)")
+    else:
+        print("✗ Same positions produce different output")
+    
+    # range testing
+    print(f"✓ Output range: [{out.min().item():.3f}, {out.max().item():.3f}]")
+
+    print("All tests completed!")
 
 
 # Subtraction-based efficient attention
@@ -119,7 +180,7 @@ class Transformer2D(nn.Module):
 #   - pos -> replace (q.k) attention with position attention.
 #   - gate -> weighted addition of  (q.k) attention and position attention.
 class Attention(nn.Module):
-    def __init__(self, dim, n_heads, dp_rate, attn_mode="qk", pos_dim=None):
+    def __init__(self, dim, n_heads, dp_rate, attn_mode="qk", pos_dim=None, rotary_emb=None):
         super(Attention, self).__init__()
         if attn_mode in ["qk", "gate"]:
             self.q_fc = nn.Linear(dim, dim, bias=False)
@@ -136,13 +197,19 @@ class Attention(nn.Module):
         self.dp = nn.Dropout(dp_rate)
         self.n_heads = n_heads
         self.attn_mode = attn_mode
+        #added rotary emb for q and k
+        self.rotary_emb = rotary_emb
 
-    def forward(self, x, pos=None, ret_attn=False):
+    def forward(self, x, pos=None, rope_pos=None, ret_attn=False):
         if self.attn_mode in ["qk", "gate"]:
             q = self.q_fc(x)
             q = q.view(x.shape[0], x.shape[1], self.n_heads, -1).permute(0, 2, 1, 3)
             k = self.k_fc(x)
             k = k.view(x.shape[0], x.shape[1], self.n_heads, -1).permute(0, 2, 1, 3)
+            # apply rotary emb for q and k
+            if self.rotary_emb is not None:
+                q = self.rotary_emb(q, rope_pos)
+                k = self.rotary_emb(k, rope_pos)
         v = self.v_fc(x)
         v = v.view(x.shape[0], x.shape[1], self.n_heads, -1).permute(0, 2, 1, 3)
 
@@ -174,19 +241,34 @@ class Attention(nn.Module):
 # Ray Transformer
 class Transformer(nn.Module):
     def __init__(
-        self, dim, ff_hid_dim, ff_dp_rate, n_heads, attn_dp_rate, attn_mode="qk", pos_dim=None
+        self,
+        dim,
+        ff_hid_dim,
+        ff_dp_rate,
+        n_heads,
+        attn_dp_rate,
+        attn_mode="qk",
+        pos_dim=None,
+        # set rope here to True to use ROPE
+        use_rope=False,
     ):
         super(Transformer, self).__init__()
         self.attn_norm = nn.LayerNorm(dim, eps=1e-6)
         self.ff_norm = nn.LayerNorm(dim, eps=1e-6)
 
         self.ff = FeedForward(dim, ff_hid_dim, ff_dp_rate)
-        self.attn = Attention(dim, n_heads, attn_dp_rate, attn_mode, pos_dim)
+        rotary_emb = None
+        if use_rope:
+            head_dim = dim // n_heads
+            rotary_emb = RotaryPositionalEmbeddings(head_dim)
+        self.attn = Attention(dim, n_heads, attn_dp_rate, attn_mode, pos_dim, rotary_emb)
+        self.use_rope = use_rope
 
-    def forward(self, x, pos=None, ret_attn=False):
+    def forward(self, x, pos=None, rope_pos=None, ret_attn=False):
         residue = x
         x = self.attn_norm(x)
-        x = self.attn(x, pos, ret_attn)
+        rope_inputs = rope_pos if self.use_rope else None
+        x = self.attn(x, pos, rope_inputs, ret_attn)
         if ret_attn:
             x, attn = x
         x = x + residue
@@ -231,12 +313,13 @@ class GNT(nn.Module):
                 n_heads=4,
                 ff_dp_rate=0.1,
                 attn_dp_rate=0.1,
+                use_rope=True,
             )
             self.view_selftrans.append(ray_trans)
             # mlp
             if i % 2 == 0:
                 q_fc = nn.Sequential(
-                    nn.Linear(args.netwidth + posenc_dim + viewenc_dim, args.netwidth),
+                    nn.Linear(args.netwidth, args.netwidth),
                     nn.ReLU(),
                     nn.Linear(args.netwidth, args.netwidth),
                 )
@@ -244,46 +327,21 @@ class GNT(nn.Module):
                 q_fc = nn.Identity()
             self.q_fcs.append(q_fc)
 
-        self.posenc_dim = posenc_dim
-        self.viewenc_dim = viewenc_dim
         self.ret_alpha = ret_alpha
         self.norm = nn.LayerNorm(args.netwidth)
         self.rgb_fc = nn.Linear(args.netwidth, 3)
         self.relu = nn.ReLU()
-        self.pos_enc = Embedder(
-            input_dims=3,
-            include_input=True,
-            max_freq_log2=9,
-            num_freqs=10,
-            log_sampling=True,
-            periodic_fns=[torch.sin, torch.cos],
-        )
-        self.view_enc = Embedder(
-            input_dims=3,
-            include_input=True,
-            max_freq_log2=9,
-            num_freqs=10,
-            log_sampling=True,
-            periodic_fns=[torch.sin, torch.cos],
-        )
 
     def forward(self, rgb_feat, ray_diff, mask, pts, ray_d):
-        # compute positional embeddings
-        viewdirs = ray_d
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
-        viewdirs = self.view_enc(viewdirs)
-        pts_ = torch.reshape(pts, [-1, pts.shape[-1]]).float()
-        pts_ = self.pos_enc(pts_)
-        pts_ = torch.reshape(pts_, list(pts.shape[:-1]) + [pts_.shape[-1]])
-        viewdirs_ = viewdirs[:, None].expand(pts_.shape)
-        embed = torch.cat([pts_, viewdirs_], dim=-1)
-        input_pts, input_views = torch.split(embed, [self.posenc_dim, self.viewenc_dim], dim=-1)
-
         # project rgb features to netwidth
         rgb_feat = self.rgbfeat_fc(rgb_feat)
         # q_init -> maxpool
         q = rgb_feat.max(dim=2)[0]
+
+        # rotary positions along each ray (sequence = samples per ray)
+        ray_dir = ray_d / torch.norm(ray_d, dim=-1, keepdim=True)
+        ray_positions = torch.sum(pts * ray_dir[:, None, :], dim=-1)
+        ray_positions = ray_positions - ray_positions[:, :1]
 
         # transformer modules
         for i, (crosstrans, q_fc, selftrans) in enumerate(
@@ -293,10 +351,9 @@ class GNT(nn.Module):
             q = crosstrans(q, rgb_feat, ray_diff, mask)
             # embed positional information
             if i % 2 == 0:
-                q = torch.cat((q, input_pts, input_views), dim=-1)
                 q = q_fc(q)
-            # ray transformer
-            q = selftrans(q, ret_attn=self.ret_alpha)
+            # ray transformer with rope positional embedding
+            q = selftrans(q, rope_pos=ray_positions, ret_attn=self.ret_alpha)
             # 'learned' density
             if self.ret_alpha:
                 q, attn = q
